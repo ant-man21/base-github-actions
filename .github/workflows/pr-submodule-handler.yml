@@ -1,0 +1,257 @@
+# .github/workflows/pr-submodule-handler.yml
+name: PR Submodule Handler
+
+on:
+  pull_request:
+    types: [opened, synchronize, closed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to process'
+        required: true
+        type: string
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  SUBMODULE_TOKEN: ${{ secrets.SUBMODULE_REPO_TOKEN }} # PAT with repo access to submodule repos
+
+jobs:
+  detect-submodule-changes:
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    outputs:
+      changed-submodules: ${{ steps.detect.outputs.changed-submodules }}
+      has-changes: ${{ steps.detect.outputs.has-changes }}
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          token: ${{ env.SUBMODULE_TOKEN }}
+
+      - name: Detect submodule changes
+        id: detect
+        run: |
+          # Get the base branch commit
+          BASE_SHA=$(git merge-base HEAD origin/main)
+          
+          # Find changed submodules
+          CHANGED_SUBMODULES=$(git diff --name-only $BASE_SHA HEAD | grep -E '^[^/]+$' | while read path; do
+            if [ -f "$path/.git" ] || [ -d "$path/.git" ]; then
+              echo "$path"
+            fi
+          done | tr '\n' ' ' | sed 's/ $//')
+          
+          echo "changed-submodules=$CHANGED_SUBMODULES" >> $GITHUB_OUTPUT
+          
+          if [ -n "$CHANGED_SUBMODULES" ]; then
+            echo "has-changes=true" >> $GITHUB_OUTPUT
+            echo "Changed submodules: $CHANGED_SUBMODULES"
+          else
+            echo "has-changes=false" >> $GITHUB_OUTPUT
+            echo "No submodule changes detected"
+          fi
+
+  create-submodule-prs:
+    needs: detect-submodule-changes
+    if: needs.detect-submodule-changes.outputs.has-changes == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        submodule: ${{ fromJson(format('["{0}"]', needs.detect-submodule-changes.outputs.changed-submodules)) }}
+    steps:
+      - name: Checkout with submodules
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          token: ${{ env.SUBMODULE_TOKEN }}
+
+      - name: Setup Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Process submodule PR
+        env:
+          SUBMODULE: ${{ matrix.submodule }}
+        run: |
+          # Extract submodule repository info
+          cd "$SUBMODULE"
+          SUBMODULE_URL=$(git config --get remote.origin.url)
+          SUBMODULE_REPO=$(echo $SUBMODULE_URL | sed 's/.*github\.com[/:]//; s/\.git$//')
+          
+          # Get current commit in submodule
+          CURRENT_COMMIT=$(git rev-parse HEAD)
+          
+          # Create branch name based on base PR
+          BRANCH_NAME="base-pr-${{ github.event.number }}-$SUBMODULE"
+          
+          # Check if branch exists in submodule repo
+          git ls-remote --heads origin $BRANCH_NAME | grep -q $BRANCH_NAME && BRANCH_EXISTS=true || BRANCH_EXISTS=false
+          
+          if [ "$BRANCH_EXISTS" = "false" ]; then
+            # Push current state to new branch
+            git checkout -b $BRANCH_NAME
+            git push -u origin $BRANCH_NAME
+          fi
+          
+          # Check if PR already exists
+          EXISTING_PR=$(curl -s -H "Authorization: token $SUBMODULE_TOKEN" \
+            "https://api.github.com/repos/$SUBMODULE_REPO/pulls?head=$BRANCH_NAME&state=open" | \
+            jq -r '.[0].number // "null"')
+          
+          if [ "$EXISTING_PR" = "null" ]; then
+            # Create PR in submodule repo
+            PR_BODY="Automated PR created for base repository PR #${{ github.event.number }}
+
+            This PR contains changes to the $SUBMODULE submodule.
+            
+            **🔗 Linked to:** ${{ github.event.pull_request.html_url }}
+            
+            **Important:** This PR will be automatically merged when the base PR is merged.
+            Do not merge this PR manually."
+            
+            SUBMODULE_PR=$(curl -s -X POST \
+              -H "Authorization: token $SUBMODULE_TOKEN" \
+              -H "Content-Type: application/json" \
+              "https://api.github.com/repos/$SUBMODULE_REPO/pulls" \
+              -d "{
+                \"title\": \"[Auto] Changes from base PR #${{ github.event.number }}\",
+                \"body\": \"$PR_BODY\",
+                \"head\": \"$BRANCH_NAME\",
+                \"base\": \"main\"
+              }")
+            
+            SUBMODULE_PR_NUMBER=$(echo $SUBMODULE_PR | jq -r '.number')
+            echo "Created submodule PR #$SUBMODULE_PR_NUMBER in $SUBMODULE_REPO"
+            
+            # Add label to link PRs
+            curl -s -X POST \
+              -H "Authorization: token $SUBMODULE_TOKEN" \
+              -H "Content-Type: application/json" \
+              "https://api.github.com/repos/$SUBMODULE_REPO/issues/$SUBMODULE_PR_NUMBER/labels" \
+              -d '{"labels": ["auto-linked", "base-pr-'${{ github.event.number }}'"]}'
+          else
+            echo "PR already exists: #$EXISTING_PR"
+            SUBMODULE_PR_NUMBER=$EXISTING_PR
+          fi
+          
+          # Store linking info
+          echo "SUBMODULE_REPO=$SUBMODULE_REPO" >> $GITHUB_ENV
+          echo "SUBMODULE_PR_NUMBER=$SUBMODULE_PR_NUMBER" >> $GITHUB_ENV
+
+      - name: Update base PR with link info
+        run: |
+          # Add comment to base PR with submodule PR links
+          COMMENT_BODY="🔗 **Linked Submodule PRs:**
+
+          - **${{ env.SUBMODULE }}**: https://github.com/${{ env.SUBMODULE_REPO }}/pull/${{ env.SUBMODULE_PR_NUMBER }}
+          
+          This base PR cannot be merged until all linked submodule PRs are resolved."
+          
+          curl -s -X POST \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.number }}/comments" \
+            -d "{\"body\": \"$COMMENT_BODY\"}"
+
+  check-linked-prs:
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check linked PRs status
+        id: check
+        run: |
+          # Get all comments on the PR to find linked submodule PRs
+          COMMENTS=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.number }}/comments")
+          
+          # Extract submodule PR URLs (this is a simplified version - in production you'd want more robust parsing)
+          LINKED_PRS=$(echo "$COMMENTS" | jq -r '.[] | select(.body | contains("Linked Submodule PRs")) | .body' | \
+            grep -oE 'https://github\.com/[^/]+/[^/]+/pull/[0-9]+' | head -10)
+          
+          ALL_CLOSED=true
+          
+          if [ -n "$LINKED_PRS" ]; then
+            echo "Checking linked PRs..."
+            for PR_URL in $LINKED_PRS; do
+              # Extract repo and PR number from URL
+              REPO=$(echo $PR_URL | sed 's|https://github\.com/||; s|/pull/.*||')
+              PR_NUM=$(echo $PR_URL | sed 's|.*/pull/||')
+              
+              # Check PR status
+              PR_STATUS=$(curl -s -H "Authorization: token $SUBMODULE_TOKEN" \
+                "https://api.github.com/repos/$REPO/pulls/$PR_NUM" | \
+                jq -r '.state')
+              
+              echo "PR $REPO#$PR_NUM status: $PR_STATUS"
+              
+              if [ "$PR_STATUS" = "open" ]; then
+                ALL_CLOSED=false
+                break
+              fi
+            done
+          fi
+          
+          echo "all-closed=$ALL_CLOSED" >> $GITHUB_OUTPUT
+          
+          if [ "$ALL_CLOSED" = "true" ]; then
+            echo "✅ All linked PRs are closed/merged"
+            exit 0
+          else
+            echo "❌ Some linked PRs are still open"
+            exit 1
+          fi
+
+  merge-submodule-prs:
+    if: github.event.action == 'closed' && github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          token: ${{ env.SUBMODULE_TOKEN }}
+
+      - name: Find and merge linked submodule PRs
+        run: |
+          # Get PR comments to find linked submodule PRs
+          COMMENTS=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.number }}/comments")
+          
+          # Extract and process each linked PR
+          echo "$COMMENTS" | jq -r '.[] | select(.body | contains("Linked Submodule PRs")) | .body' | \
+          grep -oE 'https://github\.com/[^/]+/[^/]+/pull/[0-9]+' | while read PR_URL; do
+            REPO=$(echo $PR_URL | sed 's|https://github\.com/||; s|/pull/.*||')
+            PR_NUM=$(echo $PR_URL | sed 's|.*/pull/||')
+            
+            echo "Processing $REPO#$PR_NUM"
+            
+            # Check if PR is still open
+            PR_STATUS=$(curl -s -H "Authorization: token $SUBMODULE_TOKEN" \
+              "https://api.github.com/repos/$REPO/pulls/$PR_NUM" | \
+              jq -r '.state')
+            
+            if [ "$PR_STATUS" = "open" ]; then
+              echo "Merging $REPO#$PR_NUM"
+              
+              # Merge the PR as a single commit
+              curl -s -X PUT \
+                -H "Authorization: token $SUBMODULE_TOKEN" \
+                -H "Content-Type: application/json" \
+                "https://api.github.com/repos/$REPO/pulls/$PR_NUM/merge" \
+                -d "{
+                  \"commit_title\": \"Merge PR #$PR_NUM (linked to base #${{ github.event.number }})\",
+                  \"commit_message\": \"Auto-merged with base repository PR #${{ github.event.number }}\",
+                  \"merge_method\": \"squash\"
+                }"
+              
+              echo "✅ Merged $REPO#$PR_NUM"
+            else
+              echo "ℹ️  $REPO#$PR_NUM already merged/closed"
+            fi
+          done

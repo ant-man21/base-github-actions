@@ -1,0 +1,128 @@
+# .github/workflows/pr-checks.yml
+name: PR Checks
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  lint-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Node.js (example)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: |
+          # Add your build commands here
+          echo "Installing dependencies..."
+          # npm install
+
+      - name: Lint
+        run: |
+          echo "Running linting..."
+          # npm run lint
+
+      - name: Build
+        run: |
+          echo "Building project..."
+          # npm run build
+
+      - name: Test
+        run: |
+          echo "Running tests..."
+          # npm test
+
+  check-approvals:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check approvals
+        run: |
+          APPROVALS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.number }}/reviews" | \
+            jq '[.[] | select(.state == "APPROVED")] | length')
+          
+          echo "Current approvals: $APPROVALS"
+          
+          if [ $APPROVALS -ge 1 ]; then
+            echo "✅ PR has sufficient approvals"
+          else
+            echo "❌ PR needs at least 1 approval"
+            exit 1
+          fi
+
+  check-linked-prs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify no open linked PRs
+        run: |
+          # This will call the check from the main workflow
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/pr-submodule-handler.yml/dispatches" \
+            -d "{\"ref\": \"main\", \"inputs\": {\"pr_number\": \"${{ github.event.number }}\"}}"
+          
+          # Wait a moment and check the status
+          sleep 10
+          
+          # In a real implementation, you'd check the workflow run status
+          # For now, we'll use the same logic as in the main workflow
+          
+          COMMENTS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.number }}/comments")
+          
+          LINKED_PRS=$(echo "$COMMENTS" | jq -r '.[] | select(.body | contains("Linked Submodule PRs")) | .body' | \
+            grep -oE 'https://github\.com/[^/]+/[^/]+/pull/[0-9]+' | head -10)
+          
+          ALL_CLOSED=true
+          
+          if [ -n "$LINKED_PRS" ]; then
+            for PR_URL in $LINKED_PRS; do
+              REPO=$(echo $PR_URL | sed 's|https://github\.com/||; s|/pull/.*||')
+              PR_NUM=$(echo $PR_URL | sed 's|.*/pull/||')
+              
+              PR_STATUS=$(curl -s -H "Authorization: token ${{ secrets.SUBMODULE_REPO_TOKEN }}" \
+                "https://api.github.com/repos/$REPO/pulls/$PR_NUM" | \
+                jq -r '.state')
+              
+              if [ "$PR_STATUS" = "open" ]; then
+                ALL_CLOSED=false
+                break
+              fi
+            done
+          fi
+          
+          if [ "$ALL_CLOSED" = "true" ]; then
+            echo "✅ All linked PRs are resolved"
+          else
+            echo "❌ Some linked PRs are still open - cannot merge"
+            exit 1
+          fi
+
+# Branch protection rule configuration (via GitHub API or UI)
+# POST /repos/{owner}/{repo}/branches/{branch}/protection
+# {
+#   "required_status_checks": {
+#     "strict": true,
+#     "contexts": [
+#       "lint-and-build",
+#       "check-approvals", 
+#       "check-linked-prs"
+#     ]
+#   },
+#   "enforce_admins": false,
+#   "required_pull_request_reviews": {
+#     "required_approving_review_count": 1,
+#     "dismiss_stale_reviews": true
+#   },
+#   "restrictions": null
+# }
