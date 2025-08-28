@@ -1,0 +1,21 @@
+name: Validate Submodule SHA
+on:
+  pull_request:
+    branches: [ main ]
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - name: Check submodule points to main
+        run: |
+          SUB_SHA=$(git ls-tree HEAD submodule | awk '{print $3}')
+          git -C submodule fetch origin main
+          if git -C submodule merge-base --is-ancestor "$SUB_SHA" origin/main; then
+            echo "✅ Submodule SHA is on main"
+          else
+            echo "❌ Submodule SHA not on main"; exit 1
+          fi
