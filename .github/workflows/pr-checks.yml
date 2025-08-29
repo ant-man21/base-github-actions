@@ -46,13 +46,35 @@ jobs:
     steps:
       - name: Check approvals
         run: |
-          APPROVALS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.number }}/reviews" | \
-            jq '[.[] | select(.state == "APPROVED")] | length')
+          # Get PR reviews with error handling
+          RESPONSE=$(curl -s -w "%{http_code}" -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.number }}/reviews")
+          
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          JSON_RESPONSE=$(echo "$RESPONSE" | sed '$d')
+          
+          echo "HTTP Status: $HTTP_CODE"
+          echo "Response: $JSON_RESPONSE"
+          
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "❌ Failed to fetch PR reviews (HTTP $HTTP_CODE)"
+            echo "$JSON_RESPONSE"
+            exit 1
+          fi
+          
+          # Check if response is valid JSON array
+          if ! echo "$JSON_RESPONSE" | jq -e 'type == "array"' > /dev/null 2>&1; then
+            echo "❌ Invalid response format from GitHub API"
+            echo "Response: $JSON_RESPONSE"
+            exit 1
+          fi
+          
+          # Count approved reviews
+          APPROVALS=$(echo "$JSON_RESPONSE" | jq '[.[] | select(.state == "APPROVED")] | length')
           
           echo "Current approvals: $APPROVALS"
           
-          if [ $APPROVALS -ge 1 ]; then
+          if [ "$APPROVALS" -ge 1 ]; then
             echo "✅ PR has sufficient approvals"
           else
             echo "❌ PR needs at least 1 approval"
