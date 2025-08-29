@@ -82,21 +82,7 @@ create-submodule-prs:
             echo "Creating PR in submodule repo..."
             
             # Create PR body
-            PR_BODY="🤖 **Automated PR** created for base repository PR #${{ github.event.number }}
-
-This PR contains changes to the \`$SUBMODULE\` submodule.
-
-**🔗 Linked to Base PR:** ${{ github.event.pull_request.html_url }}
-
-**⚠️ Important Notes:**
-- This PR is automatically managed
-- It will be merged when the base PR #${{ github.event.number }} is merged
-- Do not merge this PR manually
-
-**📋 Changes:**
-- Submodule commit: \`$CURRENT_COMMIT\`
-- Base PR: #${{ github.event.number }}
-- Created by: @${{ github.actor }}"
+            PR_BODY="🤖 **Automated PR** created for base repository PR #${{ github.event.number }}"
             
             # Create the PR
             SUBMODULE_PR=$(curl -s -X POST \
