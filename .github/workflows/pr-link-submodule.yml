@@ -137,8 +137,8 @@ jobs:
                 body: comment
               });
             }
-
-      - name: Create and monitor check run for submodule PR status
+      
+      - name: Create check run for submodule PR status
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -154,35 +154,10 @@ jobs:
               title = 'Submodule PR Not Found';
               summary = `No open PR found in submodule repository for branch users/${{ steps.extract.outputs.ticket_num }}`;
             } else {
-              // Extract owner, repo, and PR number from URL
-              const match = prUrl.match(/github\.com\/([^\/]+)\/([^\/]+)\/pull\/(\d+)/);
-              if (!match) {
-                status = 'completed';
-                conclusion = 'failure';
-                title = 'Invalid PR URL';
-                summary = `Could not parse PR URL: ${prUrl}`;
-              } else {
-                const [, owner, repo, prNumber] = match;
-                
-                // Check if the submodule PR is closed
-                const { data: pr } = await github.rest.pulls.get({
-                  owner: owner,
-                  repo: repo,
-                  pull_number: parseInt(prNumber)
-                });
-                
-                if (pr.state === 'closed') {
-                  status = 'completed';
-                  conclusion = 'success';
-                  title = 'Submodule PR Closed';
-                  summary = `Submodule PR ${prUrl} is now closed. Ready to proceed with merge.`;
-                } else {
-                  status = 'in_progress';
-                  conclusion = undefined;
-                  title = 'Submodule PR Linked';
-                  summary = `Linked to submodule PR: ${prUrl}\n\nWaiting for submodule PR to be closed before allowing merge.`;
-                }
-              }
+              status = 'in_progress';
+              conclusion = undefined;
+              title = 'Submodule PR Linked';
+              summary = `Linked to submodule PR: ${prUrl}\n\nWaiting for submodule PR to be closed before allowing merge.`;
             }
             
             const checkRun = {
@@ -201,73 +176,8 @@ jobs:
               checkRun.conclusion = conclusion;
             }
             
-            const { data: createdCheck } = await github.rest.checks.create(checkRun);
-            
-            // If status is in_progress, set up polling
-            if (status === 'in_progress') {
-              const maxAttempts = 30; // Poll for up to 30 minutes (30 attempts * 1 minute)
-              let attempts = 0;
-              
-              while (attempts < maxAttempts) {
-                await new Promise(resolve => setTimeout(resolve, 60000)); // Wait 1 minute
-                attempts++;
-                
-                try {
-                  // Re-check the submodule PR status
-                  const { data: currentPr } = await github.rest.pulls.get({
-                    owner: owner,
-                    repo: repo,
-                    pull_number: parseInt(prNumber)
-                  });
-                  
-                  if (currentPr.state === 'closed') {
-                    // Update the check run to success
-                    await github.rest.checks.update({
-                      owner: context.repo.owner,
-                      repo: context.repo.repo,
-                      check_run_id: createdCheck.id,
-                      status: 'completed',
-                      conclusion: 'success',
-                      output: {
-                        title: 'Submodule PR Closed',
-                        summary: `Submodule PR ${prUrl} is now closed. Ready to proceed with merge.`
-                      }
-                    });
-                    break;
-                  }
-                  
-                  // Update progress
-                  await github.rest.checks.update({
-                    owner: context.repo.owner,
-                    repo: context.repo.repo,
-                    check_run_id: createdCheck.id,
-                    status: 'in_progress',
-                    output: {
-                      title: 'Submodule PR Linked',
-                      summary: `Linked to submodule PR: ${prUrl}\n\nWaiting for submodule PR to be closed before allowing merge.\n\nPolling attempt: ${attempts}/${maxAttempts}`
-                    }
-                  });
-                } catch (error) {
-                  console.log(`Error checking PR status (attempt ${attempts}):`, error.message);
-                }
-              }
-              
-              // If we've exhausted all attempts, mark as timed out
-              if (attempts >= maxAttempts) {
-                await github.rest.checks.update({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  check_run_id: createdCheck.id,
-                  status: 'completed',
-                  conclusion: 'failure',
-                  output: {
-                    title: 'Submodule PR Check Timeout',
-                    summary: `Timed out waiting for submodule PR ${prUrl} to be closed after ${maxAttempts} minutes.`
-                  }
-                });
-              }
-            }
-            
+            // await github.rest.checks.create(checkRun);
+      
       - name: Add PR label
         uses: actions/github-script@v7
         with:
