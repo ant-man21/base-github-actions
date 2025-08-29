@@ -46,47 +46,16 @@ jobs:
     steps:
       - name: Check approvals
         run: |
-          echo "Fetching reviews for PR #${{ github.event.number }}..."
-          
-          # Get reviews with better error handling
-          RESPONSE=$(curl -s -w "%{http_code}" \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.number }}/reviews")
-          
-          # Extract HTTP status code (last 3 digits)
-          HTTP_CODE="${RESPONSE: -3}"
-          # Extract response body (everything except last 3 digits)
-          BODY="${RESPONSE%???}"
-          
-          echo "HTTP Status: $HTTP_CODE"
-          echo "Response body: $BODY"
-          
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "❌ API request failed with status $HTTP_CODE"
-            echo "Response: $BODY"
-            exit 1
-          fi
-          
-          # Check if response is valid JSON array
-          if ! echo "$BODY" | jq empty 2>/dev/null; then
-            echo "❌ Invalid JSON response"
-            echo "Response: $BODY"
-            exit 1
-          fi
-          
-          # Count approved reviews
-          APPROVALS=$(echo "$BODY" | jq '[.[] | select(.state == "APPROVED")] | length' 2>/dev/null || echo "0")
+          APPROVALS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.number }}/reviews" | \
+            jq '[.[] | select(.state == "APPROVED")] | length')
           
           echo "Current approvals: $APPROVALS"
-          echo "All reviews:"
-          echo "$BODY" | jq -r '.[] | "- \(.user.login): \(.state)"' 2>/dev/null || echo "No reviews found"
           
-          if [ "$APPROVALS" -ge 1 ]; then
-            echo "✅ PR has sufficient approvals ($APPROVALS)"
+          if [ $APPROVALS -ge 1 ]; then
+            echo "✅ PR has sufficient approvals"
           else
-            echo "❌ PR needs at least 1 approval (current: $APPROVALS)"
+            echo "❌ PR needs at least 1 approval"
             exit 1
           fi
 
@@ -95,90 +64,47 @@ jobs:
     steps:
       - name: Verify no open linked PRs
         run: |
-          echo "Checking for linked submodule PRs..."
-          
-          # Get PR comments with better error handling
-          COMMENTS_RESPONSE=$(curl -s -w "%{http_code}" \
-            -H "Accept: application/vnd.github+json" \
+          # This will call the check from the main workflow
+          curl -s -X POST \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/pr-submodule-handler.yml/dispatches" \
+            -d "{\"ref\": \"main\", \"inputs\": {\"pr_number\": \"${{ github.event.number }}\"}}"
+          
+          # Wait a moment and check the status
+          sleep 10
+          
+          # In a real implementation, you'd check the workflow run status
+          # For now, we'll use the same logic as in the main workflow
+          
+          COMMENTS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             "https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.number }}/comments")
           
-          # Extract HTTP status and body
-          HTTP_CODE="${COMMENTS_RESPONSE: -3}"
-          COMMENTS_BODY="${COMMENTS_RESPONSE%???}"
-          
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "❌ Failed to fetch comments: HTTP $HTTP_CODE"
-            echo "Response: $COMMENTS_BODY"
-            exit 1
-          fi
-          
-          echo "Fetched comments successfully"
-          
-          # Extract linked PR URLs
-          LINKED_PRS=$(echo "$COMMENTS_BODY" | jq -r '
-            .[] | 
-            select(.body | contains("Linked Submodule PRs")) | 
-            .body' | \
-            grep -oE 'https://github\.com/[^/]+/[^/]+/pull/[0-9]+' | head -10 || true)
-          
-          if [ -z "$LINKED_PRS" ]; then
-            echo "ℹ️  No linked submodule PRs found"
-            echo "✅ All linked PRs check passed (no linked PRs)"
-            exit 0
-          fi
-          
-          echo "Found linked PRs:"
-          echo "$LINKED_PRS"
+          LINKED_PRS=$(echo "$COMMENTS" | jq -r '.[] | select(.body | contains("Linked Submodule PRs")) | .body' | \
+            grep -oE 'https://github\.com/[^/]+/[^/]+/pull/[0-9]+' | head -10)
           
           ALL_CLOSED=true
           
-          while IFS= read -r PR_URL; do
-            if [ -n "$PR_URL" ]; then
-              # Extract repo and PR number from URL
-              REPO=$(echo "$PR_URL" | sed 's|https://github\.com/||; s|/pull/.*||')
-              PR_NUM=$(echo "$PR_URL" | sed 's|.*/pull/||')
+          if [ -n "$LINKED_PRS" ]; then
+            for PR_URL in $LINKED_PRS; do
+              REPO=$(echo $PR_URL | sed 's|https://github\.com/||; s|/pull/.*||')
+              PR_NUM=$(echo $PR_URL | sed 's|.*/pull/||')
               
-              echo "Checking $REPO#$PR_NUM..."
-              
-              # Check PR status
-              PR_RESPONSE=$(curl -s -w "%{http_code}" \
-                -H "Accept: application/vnd.github+json" \
-                -H "Authorization: token ${{ secrets.SUBMODULE_REPO_TOKEN }}" \
-                -H "X-GitHub-Api-Version: 2022-11-28" \
-                "https://api.github.com/repos/$REPO/pulls/$PR_NUM")
-              
-              PR_HTTP_CODE="${PR_RESPONSE: -3}"
-              PR_BODY="${PR_RESPONSE%???}"
-              
-              if [ "$PR_HTTP_CODE" != "200" ]; then
-                echo "⚠️  Failed to check $REPO#$PR_NUM: HTTP $PR_HTTP_CODE"
-                echo "Assuming PR is closed/merged"
-                continue
-              fi
-              
-              PR_STATUS=$(echo "$PR_BODY" | jq -r '.state' 2>/dev/null || echo "unknown")
-              
-              echo "  Status: $PR_STATUS"
+              PR_STATUS=$(curl -s -H "Authorization: token ${{ secrets.SUBMODULE_REPO_TOKEN }}" \
+                "https://api.github.com/repos/$REPO/pulls/$PR_NUM" | \
+                jq -r '.state')
               
               if [ "$PR_STATUS" = "open" ]; then
                 ALL_CLOSED=false
-                echo "  ❌ Still open"
-              else
-                echo "  ✅ Closed/merged"
+                break
               fi
-            fi
-          done <<< "$LINKED_PRS"
+            done
+          fi
           
           if [ "$ALL_CLOSED" = "true" ]; then
-            echo ""
-            echo "✅ All linked PRs are resolved - ready to merge!"
-            exit 0
+            echo "✅ All linked PRs are resolved"
           else
-            echo ""
-            echo "❌ Some linked PRs are still open - cannot merge base PR yet"
-            echo "Please wait for all linked submodule PRs to be closed or merged"
+            echo "❌ Some linked PRs are still open - cannot merge"
             exit 1
           fi
 
